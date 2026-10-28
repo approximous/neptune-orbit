@@ -1,0 +1,241 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Orbiting Neptune</title>
+<style>
+html,body{margin:0;height:100%;background:#000;overflow:hidden;font:15px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif;color:#cfe3ff}
+canvas{display:block;touch-action:none}
+#hud{position:fixed;left:max(14px,env(safe-area-inset-left));top:max(14px,env(safe-area-inset-top));margin:0;font-variant-numeric:tabular-nums;white-space:pre;text-shadow:0 1px 6px #000;pointer-events:none}
+#hud b{font-weight:600;font-size:18px;color:#fff}
+#bar{position:fixed;left:0;right:0;bottom:max(12px,env(safe-area-inset-bottom));display:flex;flex-wrap:wrap;gap:6px;justify-content:center;padding:0 10px}
+#bar button{font:inherit;color:#cfe3ff;background:#0a1530b8;border:1px solid #2a4a86;border-radius:6px;padding:7px 11px;cursor:pointer;backdrop-filter:blur(6px)}
+#bar button.on{background:#2a5cc8;color:#fff;border-color:#7fb0ff}
+#bar button:focus-visible{outline:2px solid #fff;outline-offset:2px}
+#tip{position:fixed;right:14px;top:max(14px,env(safe-area-inset-top));max-width:230px;text-align:right;opacity:.6;font-size:13px;pointer-events:none}
+</style>
+<script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"}}</script>
+</head>
+<body>
+<pre id="hud"></pre>
+<div id="tip">Drag to look. Keys 1 to 5 set time warp, O changes orbit, N toggles nadir lock, Space pauses. Use Enter VR on a headset: trigger cycles warp, grip cycles orbit.</div>
+<div id="bar"></div>
+<script type="module">
+import * as THREE from 'three';
+import {VRButton} from 'three/addons/webxr/VRButton.js';
+
+// Units: 1 scene unit = 1000 km. Frame: Neptune equator in the XZ plane, spin axis +Y.
+const R = 24.622, GM = 6.8365e6, TRITON_R = 354.759, TRITON_P = 5.877 * 86400, SPIN = 16.11 * 3600;
+const SUN = new THREE.Vector3(0.85, 0.45, 0.28).normalize(), X = new THREE.Vector3(1,0,0), Y = new THREE.Vector3(0,1,0);
+const D2R = Math.PI / 180;
+
+const renderer = new THREE.WebGLRenderer({antialias: true});
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.xr.enabled = true;
+document.body.appendChild(renderer.domElement);
+document.body.appendChild(VRButton.createButton(renderer));
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(70, innerWidth / innerHeight, 0.05, 30000);
+const rig = new THREE.Group(); rig.add(camera); scene.add(rig);
+
+// Stars, denser along a tilted galactic band
+{
+  const n = 8000, p = new Float32Array(n * 3), c = new Float32Array(n * 3);
+  for (let i = 0; i < n; i++) {
+    let u = Math.random() * 2 - 1; if (Math.random() < 0.5) u *= 0.18;
+    const a = Math.random() * 6.2832, s = Math.sqrt(1 - u * u);
+    p.set([s * Math.cos(a) * 9000, u * 9000, s * Math.sin(a) * 9000], i * 3);
+    const b = 0.3 + Math.pow(Math.random(), 3) * 0.7, t = Math.random();
+    c.set([b * (0.85 + 0.15 * t), b * 0.92, b * (1.05 - 0.25 * t)], i * 3);
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(p, 3));
+  g.setAttribute('color', new THREE.BufferAttribute(c, 3));
+  const stars = new THREE.Points(g, new THREE.PointsMaterial({size: 1.6, sizeAttenuation: false, vertexColors: true, depthWrite: false}));
+  stars.rotation.x = 1.0; scene.add(stars);
+}
+
+// Sun, 30 AU away: a tiny, very bright point
+{
+  const cv = document.createElement('canvas'); cv.width = cv.height = 128;
+  const x = cv.getContext('2d'), gr = x.createRadialGradient(64,64,0,64,64,64);
+  gr.addColorStop(0,'#fff'); gr.addColorStop(.08,'#fff'); gr.addColorStop(.25,'rgba(255,240,210,.35)'); gr.addColorStop(1,'rgba(255,240,210,0)');
+  x.fillStyle = gr; x.fillRect(0,0,128,128);
+  const tx = new THREE.CanvasTexture(cv); tx.colorSpace = THREE.SRGBColorSpace;
+  const sp = new THREE.Sprite(new THREE.SpriteMaterial({map: tx, blending: THREE.AdditiveBlending, depthWrite: false}));
+  sp.position.copy(SUN).multiplyScalar(8500); sp.scale.setScalar(240); scene.add(sp);
+}
+
+const NOISE = `
+float hash(vec3 p){p=fract(p*.3183099+.1);p*=17.;return fract(p.x*p.y*p.z*(p.x+p.y+p.z));}
+float noise(vec3 x){vec3 i=floor(x),f=fract(x);f=f*f*(3.-2.*f);
+return mix(mix(mix(hash(i),hash(i+vec3(1,0,0)),f.x),mix(hash(i+vec3(0,1,0)),hash(i+vec3(1,1,0)),f.x),f.y),
+mix(mix(hash(i+vec3(0,0,1)),hash(i+vec3(1,0,1)),f.x),mix(hash(i+vec3(0,1,1)),hash(i+vec3(1,1,1)),f.x),f.y),f.z);}
+float fbm(vec3 p){float a=.5,s=0.;for(int i=0;i<5;i++){s+=a*noise(p);p*=2.03;a*=.5;}return s;}`;
+const VERT = `varying vec3 vP,vWN,vWP,vN;
+void main(){vP=position;vN=normalize(normalMatrix*normal);vWN=normalize(mat3(modelMatrix)*normal);
+vWP=(modelMatrix*vec4(position,1.)).xyz;gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.);}`;
+const uSun = {value: SUN};
+
+// Neptune: banded methane atmosphere, cirrus streaks, Great Dark Spot with companion cloud
+const neptune = new THREE.Mesh(new THREE.SphereGeometry(R, 128, 96), new THREE.ShaderMaterial({
+  uniforms: {uSun}, vertexShader: VERT,
+  fragmentShader: `varying vec3 vP,vWN,vWP,vN; uniform vec3 uSun;` + NOISE + `
+void main(){
+ vec3 p=normalize(vP); float lat=asin(p.y), lon=atan(p.z,p.x);
+ float t=fbm(p*3.5);
+ float bands=.5+.5*sin(lat*13.+t*3.2);
+ vec3 col=mix(vec3(.03,.10,.55),vec3(.13,.34,.85),bands);
+ col=mix(col,vec3(.40,.66,.98),.35*smoothstep(.45,.8,fbm(p*7.+2.)));
+ float cir=smoothstep(.62,.82,fbm(vec3(p.x*2.2,p.y*26.,p.z*2.2)+3.));
+ col=mix(col,vec3(.9,.96,1.),cir*.7);
+ float dl=lon-1.0; dl=atan(sin(dl),cos(dl));
+ float d=length(vec2(dl*cos(lat),lat+.38)/vec2(.30,.15));
+ col=mix(col,vec3(.012,.035,.2),(1.-smoothstep(.55,1.,d))*.9);
+ float c2=length(vec2((dl-.38)*cos(lat),lat+.62)/vec2(.13,.03));
+ col=mix(col,vec3(1.),(1.-smoothstep(0.,1.,c2))*.9);
+ vec3 N=normalize(vWN),V=normalize(cameraPosition-vWP);
+ float lit=smoothstep(-.12,.55,dot(N,uSun));
+ float rim=pow(1.-max(dot(N,V),0.),3.);
+ gl_FragColor=vec4(col*(.015+1.25*lit)+vec3(.2,.45,1.)*rim*(.12+.8*lit),1.);
+}`}));
+scene.add(neptune);
+
+// Atmospheric limb glow
+scene.add(new THREE.Mesh(new THREE.SphereGeometry(R * 1.05, 96, 64), new THREE.ShaderMaterial({
+  uniforms: {uSun}, vertexShader: VERT, side: THREE.BackSide, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
+  fragmentShader: `varying vec3 vP,vWN,vWP,vN; uniform vec3 uSun;
+void main(){float c=clamp(-vN.z,0.,1.);float lit=smoothstep(-.35,.6,dot(normalize(vWN),uSun));
+float i=pow(c,1.4)*1.5*(.08+lit);gl_FragColor=vec4(vec3(.28,.55,1.)*i,i);}`})));
+
+// Faint rings: Galle, Le Verrier (+ Lassell), Arago, Adams (with arcs)
+const rings = new THREE.Mesh(new THREE.RingGeometry(38, 66, 256, 1), new THREE.ShaderMaterial({
+  vertexShader: VERT, transparent: true, depthWrite: false, side: THREE.DoubleSide,
+  fragmentShader: `varying vec3 vP,vWN,vWP,vN;
+void main(){float r=length(vP.xy),a=atan(vP.y,vP.x);
+float g=.2*exp(-pow((r-41.9)/1.8,2.));
+float l=.09*smoothstep(53.2,53.6,r)*(1.-smoothstep(57.,57.4,r))+.4*exp(-pow((r-53.2)/.35,2.));
+float arc=pow(.5+.5*sin(a*5.+2.),2.);
+float ad=.5*exp(-pow((r-62.9)/.35,2.))*(.3+.7*arc);
+float al=g+l+ad; if(al<.004) discard;
+gl_FragColor=vec4(vec3(.62,.56,.5),al);}`}));
+rings.rotation.x = -Math.PI / 2; scene.add(rings);
+
+// Triton: procedural canvas texture, tidally locked
+const tex = (() => {
+  const cv = document.createElement('canvas'); cv.width = 512; cv.height = 256;
+  const x = cv.getContext('2d'); x.fillStyle = '#cdbfb8'; x.fillRect(0,0,512,256);
+  const sg = x.createLinearGradient(0,256,0,120); sg.addColorStop(0,'#e8b9a8'); sg.addColorStop(1,'rgba(232,185,168,0)');
+  x.fillStyle = sg; x.fillRect(0,0,512,256);
+  for (let i = 0; i < 900; i++) {
+    const px = Math.random()*512, py = Math.random()*256, r = 3 + Math.random()*26, dark = Math.random() < .45;
+    const g = x.createRadialGradient(px,py,0,px,py,r);
+    g.addColorStop(0, dark ? 'rgba(70,60,70,.22)' : 'rgba(255,250,245,.2)'); g.addColorStop(1,'rgba(0,0,0,0)');
+    x.fillStyle = g; x.fillRect(px-r,py-r,2*r,2*r);
+  }
+  const t = new THREE.CanvasTexture(cv); t.colorSpace = THREE.SRGBColorSpace; return t;
+})();
+const triton = new THREE.Mesh(new THREE.SphereGeometry(1.353, 64, 48), new THREE.MeshStandardMaterial({map: tex, roughness: 1}));
+scene.add(triton);
+const sunLight = new THREE.DirectionalLight(0xfff4e8, 3.2); sunLight.position.copy(SUN).multiplyScalar(1000);
+scene.add(sunLight, new THREE.AmbientLight(0x6070a0, 0.04));
+
+// Orbits (radii in 1000 km, angles in degrees)
+const ORB = [
+  {n: 'Ring crossing', rp: 1.5*R, ra: 2.9*R, i: 15, O: 0, w: 0, warp: 2},
+  {n: 'Polar science orbit', rp: 1.15*R, ra: 3.0*R, i: 90, O: 20, w: 0, warp: 2},
+  {n: 'Triton rendezvous', rp: 1.2*R, ra: 359, i: 157, O: 0, w: 0, warp: 3, sync: true}];
+const WARPS = [1, 60, 300, 1200, 6000];
+let o, a, e, b, aK, nn, P, thetaT0, ok = 0, t = 0, wi = 2, paused = false, nadirLock = true, yaw = 0, pitch = 0;
+function setOrbit(k) {
+  ok = k; o = ORB[k]; a = (o.rp + o.ra) / 2; e = (o.ra - o.rp) / (o.ra + o.rp); b = a * Math.sqrt(1 - e*e);
+  aK = a * 1000; nn = Math.sqrt(GM / Math.pow(aK, 3)); P = 2 * Math.PI / nn;
+  thetaT0 = o.sync ? Math.PI - (2 * Math.PI / TRITON_P) * P / 2 : 1.0;
+  t = 0; wi = o.warp;
+}
+function posAt(tt) {
+  const M = (nn * tt) % (2 * Math.PI); let E = M;
+  for (let i = 0; i < 9; i++) E -= (E - e * Math.sin(E) - M) / (1 - e * Math.cos(E));
+  return new THREE.Vector3(a * (Math.cos(E) - e), 0, b * Math.sin(E))
+    .applyAxisAngle(Y, o.w * D2R).applyAxisAngle(X, o.i * D2R).applyAxisAngle(Y, o.O * D2R);
+}
+function alignToNadir(p) {
+  const z = p.clone().normalize(), v = posAt(t + 20).sub(p).normalize();
+  const y = v.sub(z.clone().multiplyScalar(v.dot(z))).normalize(), x = y.clone().cross(z);
+  rig.quaternion.setFromRotationMatrix(new THREE.Matrix4().makeBasis(x, y, z));
+}
+
+// VR cockpit panel and controllers
+const pc = document.createElement('canvas'); pc.width = 640; pc.height = 320;
+const ptex = new THREE.CanvasTexture(pc); ptex.colorSpace = THREE.SRGBColorSpace;
+const panel = new THREE.Mesh(new THREE.PlaneGeometry(1.4, 0.7), new THREE.MeshBasicMaterial({map: ptex, transparent: true}));
+panel.position.set(0, 1.0, -1.3); panel.visible = false; rig.add(panel);
+for (let i = 0; i < 2; i++) {
+  const c = renderer.xr.getController(i); rig.add(c);
+  c.addEventListener('selectstart', () => wi = (wi + 1) % WARPS.length);
+  c.addEventListener('squeezestart', () => { setOrbit((ok + 1) % ORB.length); });
+}
+renderer.xr.addEventListener('sessionstart', () => { nadirLock = false; alignToNadir(posAt(t)); });
+renderer.xr.addEventListener('sessionend', () => { nadirLock = true; });
+
+// Desktop and touch controls
+const bar = document.getElementById('bar'), hud = document.getElementById('hud'), btns = {w: [], o: []};
+const mk = (txt, fn, list) => { const x = document.createElement('button'); x.textContent = txt; x.onclick = fn; bar.appendChild(x); list && list.push(x); return x; };
+WARPS.forEach((w, i) => mk('\u00d7' + w, () => wi = i, btns.w));
+ORB.forEach((q, k) => mk(q.n, () => setOrbit(k), btns.o));
+const bn = mk('Nadir lock', () => nadirLock = !nadirLock), bp = mk('Pause', () => paused = !paused);
+addEventListener('keydown', ev => {
+  if (ev.key >= '1' && ev.key <= '5') wi = +ev.key - 1;
+  else if (ev.key === 'o') setOrbit((ok + 1) % ORB.length);
+  else if (ev.key === 'n') nadirLock = !nadirLock;
+  else if (ev.key === ' ') { paused = !paused; ev.preventDefault(); }
+});
+let drag = false;
+const cvs = renderer.domElement;
+cvs.addEventListener('pointerdown', () => drag = true);
+addEventListener('pointerup', () => drag = false);
+cvs.addEventListener('pointermove', ev => {
+  if (!drag) return;
+  yaw -= ev.movementX * 0.004; pitch = Math.max(-1.5, Math.min(1.5, pitch - ev.movementY * 0.004));
+});
+addEventListener('resize', () => { camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth, innerHeight); });
+
+const fmt = n => Math.round(n).toLocaleString('en-US');
+const met = s => `${Math.floor(s / 86400)} d ${Math.floor(s % 86400 / 3600)} h ${Math.floor(s % 3600 / 60)} m`;
+function updateHud(p) {
+  const rK = p.length() * 1000, v = Math.sqrt(GM * (2 / rK - 1 / aK));
+  const lines = [o.n, `Altitude ${fmt(rK - R * 1000)} km`, `Speed ${v.toFixed(2)} km/s`, `Orbital period ${(P / 3600).toFixed(1)} h`,
+    `Triton range ${fmt(p.distanceTo(triton.position) * 1000)} km`, `Time warp \u00d7${WARPS[wi]}${paused ? ' (paused)' : ''}`,
+    `Elapsed ${met(t)}`, `Earth light time 4 h 0 m`];
+  hud.innerHTML = `<b>Orbiting Neptune</b>\n` + lines.join('\n');
+  const x = pc.getContext('2d'); x.clearRect(0, 0, 640, 320);
+  x.fillStyle = 'rgba(8,18,48,.82)'; x.fillRect(0, 0, 640, 320);
+  x.fillStyle = '#bcd8ff'; x.font = '28px system-ui,sans-serif';
+  lines.forEach((l, i) => x.fillText(l, 24, 44 + i * 36));
+  ptex.needsUpdate = true;
+  btns.w.forEach((x, i) => x.classList.toggle('on', i === wi));
+  btns.o.forEach((x, i) => x.classList.toggle('on', i === ok));
+  bn.classList.toggle('on', nadirLock); bp.classList.toggle('on', paused);
+}
+
+setOrbit(0);
+const clock = new THREE.Clock(); let hudT = 0;
+renderer.setAnimationLoop(() => {
+  const dt = Math.min(clock.getDelta(), 0.1);
+  if (!paused) t += dt * WARPS[wi];
+  const p = posAt(t); rig.position.copy(p);
+  neptune.rotation.y = t * 2 * Math.PI / SPIN;
+  const th = thetaT0 + t * 2 * Math.PI / TRITON_P;
+  triton.position.set(TRITON_R * Math.cos(th), 0, TRITON_R * Math.sin(th)).applyAxisAngle(X, 157 * D2R);
+  triton.lookAt(0, 0, 0);
+  const xr = renderer.xr.isPresenting;
+  panel.visible = xr;
+  if (!xr) { if (nadirLock) alignToNadir(p); camera.rotation.set(pitch, yaw, 0, 'YXZ'); }
+  if ((hudT -= dt) <= 0) { hudT = 0.25; updateHud(p); }
+  renderer.render(scene, camera);
+});
+</script>
+</body>
+</html>
